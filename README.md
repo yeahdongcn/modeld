@@ -37,3 +37,9 @@ docker cli:
 cd cmd/modeld
 docker -H unix://$PWD/model.sock images
 ```
+
+## References
+
+- https://docs.docker.com/engine/api/v1.44/
+- https://github.com/buildkite/sockguard
+- https://github.com/ollama/ollama
