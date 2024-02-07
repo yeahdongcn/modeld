@@ -1,10 +1,21 @@
 package modeld
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"os"
+	"path"
+	"path/filepath"
 	"regexp"
+	"strings"
 
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/pkg/progress"
+	"github.com/jmorganca/ollama/api"
+	"github.com/yeahdongcn/modeld/server"
 	"github.com/yeahdongcn/modeld/socketproxy"
 )
 
@@ -22,6 +33,12 @@ func writeError(w http.ResponseWriter, msg string, code int) {
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"message": msg,
 	})
+}
+
+func writeSuccess(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func (r *RulesDirector) Direct(l socketproxy.Logger, req *http.Request, upstream http.Handler) http.Handler {
@@ -66,9 +83,11 @@ func (r *RulesDirector) Direct(l socketproxy.Logger, req *http.Request, upstream
 
 	// Image related endpoints
 	case match(`GET`, `^/images/json$`):
-		return upstream
+		return r.handleImageList(l, req, upstream)
 	case match(`POST`, `^/images/create$`):
-		return upstream
+		return r.handleImagePull(l, req, upstream)
+	case match(`DELETE`, `^/images/(.+)$`):
+		return r.handleImageDelete(l, req, upstream)
 	case match(`POST`, `^/images/(create|search|get|load)$`):
 		break
 	case match(`POST`, `^/images/prune$`):
@@ -104,8 +123,149 @@ func (r *RulesDirector) Direct(l socketproxy.Logger, req *http.Request, upstream
 	return errorHandler(req.Method+" "+req.URL.Path+" not implemented yet", http.StatusNotImplemented)
 }
 
+func (r *RulesDirector) handleImageList(l socketproxy.Logger, req *http.Request, upstream http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// Parse out query string to modify it
+		var q = req.URL.Query()
+
+		l.Printf("Query: %v", q)
+
+		models := make([]api.ModelResponse, 0)
+		manifestsPath, err := server.GetManifestPath()
+		if err != nil {
+			writeError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		modelResponse := func(modelName string) (api.ModelResponse, error) {
+			model, err := server.GetModel(modelName)
+			if err != nil {
+				return api.ModelResponse{}, err
+			}
+
+			modelDetails := api.ModelDetails{
+				Format:            model.Config.ModelFormat,
+				Family:            model.Config.ModelFamily,
+				Families:          model.Config.ModelFamilies,
+				ParameterSize:     model.Config.ModelType,
+				QuantizationLevel: model.Config.FileType,
+			}
+
+			return api.ModelResponse{
+				Model:   model.ShortName,
+				Name:    model.ShortName,
+				Size:    model.Size,
+				Digest:  model.Digest,
+				Details: modelDetails,
+			}, nil
+		}
+
+		walkFunc := func(path string, info os.FileInfo, _ error) error {
+			if !info.IsDir() {
+				path, tag := filepath.Split(path)
+				model := strings.Trim(strings.TrimPrefix(path, manifestsPath), string(os.PathSeparator))
+				modelPath := strings.Join([]string{model, tag}, ":")
+				canonicalModelPath := strings.ReplaceAll(modelPath, string(os.PathSeparator), "/")
+
+				resp, err := modelResponse(canonicalModelPath)
+				if err != nil {
+					slog.Info(fmt.Sprintf("skipping file: %s", canonicalModelPath))
+					// nolint: nilerr
+					return nil
+				}
+
+				resp.ModifiedAt = info.ModTime()
+				models = append(models, resp)
+			}
+
+			return nil
+		}
+
+		if err := filepath.Walk(manifestsPath, walkFunc); err != nil {
+			writeError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		images := make([]image.Summary, 0)
+		for _, model := range models {
+			images = append(images, image.Summary{
+				RepoTags: []string{model.Name},
+				ID:       model.Digest,
+				Size:     model.Size,
+				Created:  model.ModifiedAt.Unix(),
+			})
+		}
+		writeSuccess(w, images)
+	})
+}
+
+func (r *RulesDirector) handleImagePull(l socketproxy.Logger, req *http.Request, upstream http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// Parse out query string to modify it
+		var q = req.URL.Query()
+
+		regOpts := &server.RegistryOptions{
+			// TODO: Make this configurable
+			Insecure: true,
+		}
+
+		fn := func(r api.ProgressResponse) {
+			progress := progress.Progress{
+				Total: r.Total,
+				ID:    r.Digest,
+			}
+			_ = json.NewEncoder(w).Encode(progress)
+		}
+
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+
+		model := fmt.Sprintf("%s:%s", q.Get("fromImage"), q.Get("tag"))
+		if err := server.PullModel(ctx, model, regOpts, fn); err != nil {
+			writeError(w, err.Error(), http.StatusInternalServerError)
+		}
+	})
+}
+
+func (r *RulesDirector) handleImageDelete(l socketproxy.Logger, req *http.Request, upstream http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		model := path.Base(req.URL.Path)
+		if err := server.DeleteModel(model); err != nil {
+			if os.IsNotExist(err) {
+				writeError(w, fmt.Sprintf("model '%s' not found", model), http.StatusNotFound)
+			} else {
+				writeError(w, err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+
+		manifestsPath, err := server.GetManifestPath()
+		if err != nil {
+			writeError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if err := server.PruneDirectory(manifestsPath); err != nil {
+			writeError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		writeSuccess(w, []image.DeleteResponse{
+			{
+				Deleted: model,
+			},
+		})
+	})
+}
+
 func (r *RulesDirector) handleContainerCreate(l socketproxy.Logger, req *http.Request, upstream http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// Parse out query string to modify it
+		var q = req.URL.Query()
+
+		// Rebuild the query string ready to forward request
+		req.URL.RawQuery = q.Encode()
+
 		upstream.ServeHTTP(w, req)
 	})
 }
